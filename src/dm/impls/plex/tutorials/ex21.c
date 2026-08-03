@@ -129,6 +129,42 @@ static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
     }
     /* Verify: w1d[0] should equal w0 */
   }
+  /* DIAGNOSTIC: Lagrange basis functions must sum to 1.0 at every point
+     (partition of unity), and their derivatives must sum to 0.0 (derivative
+     of the constant function 1). These properties hold regardless of node
+     type (equispaced, GLL, etc.) or axis-ordering convention. If either
+     check fails, the extraction indexing assumption below is wrong,
+     independent of closure ordering, geometry, or physics. */
+  {
+    PetscInt  q, i;
+    PetscReal maxErrB = 0.0, maxErrD = 0.0;
+
+    for (q = 0; q < nq; ++q) {
+      PetscReal sumB = 0.0, sumD = 0.0;
+      for (i = 0; i < nd; ++i) {
+        sumB += b->B[q * nd + i];
+        sumD += b->D[q * nd + i];
+      }
+      maxErrB = PetscMax(maxErrB, PetscAbsReal(sumB - 1.0));
+      maxErrD = PetscMax(maxErrD, PetscAbsReal(sumD));
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: partition-of-unity max error = %e (want ~1e-14)\n",
+      (double)maxErrB));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: derivative-sum max error     = %e (want ~1e-14)\n",
+      (double)maxErrD));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: raw B1d[q][i] matrix (nq=%"
+      PetscInt_FMT " x nd=%" PetscInt_FMT "):\n", nq, nd));
+    for (q = 0; q < nq; ++q) {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  q=%" PetscInt_FMT ": ", q));
+      for (i = 0; i < nd; ++i) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%8.5f ", (double)b->B[q * nd + i]));
+      }
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+    }
+  }
+
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -509,6 +545,26 @@ int main(int argc, char **argv)
   PetscCall(DMCreateGlobalVector(dm, &x));
   PetscCall(VecDuplicate(x, &y_sf));
   PetscCall(VecDuplicate(x, &y_ref));
+
+  /* DIAGNOSTIC: constant-field null-space test.
+     grad(constant) = 0 everywhere, so the Laplacian operator action on a
+     constant field must be exactly zero (up to roundoff). This isolates
+     the gather/scatter + contraction pipeline from the random-field test
+     below, independent of the basis-extraction diagnostics above. */
+  if (ctx.verify) {
+    Vec       xConst, yConst;
+    PetscReal normConst;
+
+    PetscCall(VecDuplicate(x, &xConst));
+    PetscCall(VecDuplicate(x, &yConst));
+    PetscCall(VecSet(xConst, 1.0));
+    PetscCall(ApplySumFact(dm, xConst, yConst, &basis, LaplacianPointwise));
+    PetscCall(VecNorm(yConst, NORM_2, &normConst));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: ||A*1|| = %e (want ~1e-12 or smaller)\n", (double)normConst));
+    PetscCall(VecDestroy(&xConst));
+    PetscCall(VecDestroy(&yConst));
+  }
 
   /* Initialize x with a nontrivial function */
   {
