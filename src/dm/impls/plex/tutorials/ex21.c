@@ -194,25 +194,6 @@ static void RotateOuter(const PetscScalar *src, PetscScalar *dst,
   }
 }
 
-/* ------------------------------------------------------------------- */
-/*  3D interpolation:  u[i3][i2][i1] -> v[q1][q2][q3]                  */
-/*  Three 1D contractions with transposes, following bp_operator.hpp.   */
-/* ------------------------------------------------------------------- */
-static void Interp3D(const PetscReal *B, PetscInt nq, PetscInt nd,
-                     const PetscScalar *u, PetscScalar *v,
-                     PetscScalar *t1, PetscScalar *t2)
-{
-  /* Pass 1: contract i1.  u[i3*nd+i2, i1] -> t1[i3*nd+i2, q1] */
-  Contract1D(B, nq, nd, u, t1, nd * nd);
-  /* Transpose: [i3][i2][q1] -> [i3][q1][i2] */
-  TransposeInner(t1, t2, nd, nd, nq);
-  /* Pass 2: contract i2.  t2[i3*nq+q1, i2] -> t1[i3*nq+q1, q2] */
-  Contract1D(B, nq, nd, t2, t1, nd * nq);
-  /* Rotate: [i3][q1][q2] -> [q1][q2][i3] */
-  RotateOuter(t1, t2, nd, nq, nq);
-  /* Pass 3: contract i3.  t2[q1*nq+q2, i3] -> v[q1*nq+q2, q3] */
-  Contract1D(B, nq, nd, t2, v, nq * nq);
-}
 
 /* ------------------------------------------------------------------- */
 /*  3D gradient: u[i3][i2][i1] -> Gx,Gy,Gz[q1][q2][q3]                */
@@ -478,13 +459,20 @@ int main(int argc, char **argv)
   PetscCall(DMGetDimension(dm, &dim));
   PetscCall(DMViewFromOptions(dm, NULL, "-dm_view"));
 
-  /* Setup PetscFE: tensor-product Lagrange (isSimplex = false) */
-  PetscCall(PetscFECreateLagrange(PETSC_COMM_SELF, dim, 1, PETSC_FALSE,
-                                  PETSC_DETERMINE, PETSC_DETERMINE, &fe));
+  /* Setup PetscFE: tensor-product Lagrange (isSimplex = false).
+     PetscFECreateDefault reads -petscspace_degree from the command line. */
+  PetscCall(PetscFECreateDefault(PETSC_COMM_SELF, dim, 1, PETSC_FALSE,
+                                 NULL, PETSC_DETERMINE, &fe));
   PetscCall(DMSetField(dm, 0, NULL, (PetscObject)fe));
   PetscCall(DMCreateDS(dm));
   PetscCall(DMGetDS(dm, &ds));
   PetscCall(PetscDSSetResidual(ds, 0, f0_zero, f1_grad));
+
+  /* Trigger local coordinate setup so DMPlexComputeCellGeometryFEM works */
+  {
+    Vec coordsLocal;
+    PetscCall(DMGetCoordinatesLocal(dm, &coordsLocal));
+  }
 
   {
     PetscSpace sp;
