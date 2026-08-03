@@ -474,6 +474,23 @@ int main(int argc, char **argv)
     PetscCall(DMGetCoordinatesLocal(dm, &coordsLocal));
   }
 
+  /* Set tensor closure permutation so DMPlexVecGetClosure/SetClosure and
+     cell geometry queries return DOFs and coordinates in lexicographic
+     (ix,iy,iz) order, matching what our sum-factorization kernels assume.
+     PETSc's default closure order is breadth-first over mesh points
+     (vertices, then edges, then faces, then interior), which does NOT
+     match tensor order for degree > 1.
+
+     Must be set on both the primary DM and its coordinate DM: the
+     coordinate DM does not inherit this automatically
+     (see PETSc GitLab issue #541). */
+  PetscCall(DMPlexSetClosurePermutationTensor(dm, PETSC_DETERMINE, NULL));
+  {
+    DM cdm;
+    PetscCall(DMGetCoordinateDM(dm, &cdm));
+    PetscCall(DMPlexSetClosurePermutationTensor(cdm, PETSC_DETERMINE, NULL));
+  }
+
   {
     PetscSpace sp;
     PetscCall(PetscFEGetBasisSpace(fe, &sp));
