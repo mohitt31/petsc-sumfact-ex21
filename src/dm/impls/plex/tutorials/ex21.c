@@ -37,6 +37,18 @@ typedef struct {
   PetscInt  niter;
 } AppCtx;
 
+/* DIAGNOSTIC: project the physical X-coordinate onto the FE space.
+   Used to empirically determine the closure array's flat-index-to-axis
+   mapping: since the projected field's DOF value at any node equals that
+   node's physical X-coordinate, printing the closure array reveals
+   exactly which flat index varies with X, Y, and Z. */
+static PetscErrorCode CoordXFunc(PetscInt dim, PetscReal time, const PetscReal xc[],
+                                 PetscInt Nc, PetscScalar *u, void *ctx)
+{
+  u[0] = xc[0];
+  return 0;
+}
+
 /* ------------------------------------------------------------------- */
 /*  1D basis and even-odd precomputation                                */
 /* ------------------------------------------------------------------- */
@@ -564,6 +576,52 @@ int main(int argc, char **argv)
       "DIAGNOSTIC: ||A*1|| = %e (want ~1e-12 or smaller)\n", (double)normConst));
     PetscCall(VecDestroy(&xConst));
     PetscCall(VecDestroy(&yConst));
+  }
+
+  /* DIAGNOSTIC: project physical X-coordinate onto the field, then dump
+     cell 0's closure array decoded via our assumed flat-index formula
+     idx = iz*nd*nd + iy*nd + ix (ix fastest). Since the projected value
+     AT a node equals that node's physical X-coordinate, this directly
+     reveals which axis (if any) ix/iy/iz actually correspond to in the
+     real closure layout: entries that vary only with ix (not iy,iz)
+     confirm ix maps to physical X. If instead entries vary with iz (or
+     some other pattern) while ix is held fixed in the printout, that
+     tells us the true flat-index-to-axis correspondence. */
+  if (ctx.verify) {
+    Vec       xCoord;
+    Vec       localXCoord;
+    PetscSection section;
+    PetscScalar *u_e = NULL;
+    PetscInt     closureSize, ix, iy, iz, nd = basis.nd;
+    PetscErrorCode (*funcs[1])(PetscInt, PetscReal, const PetscReal[], PetscInt, PetscScalar *, void *);
+
+    funcs[0] = CoordXFunc;
+    PetscCall(VecDuplicate(x, &xCoord));
+    PetscCall(DMProjectFunction(dm, 0.0, funcs, NULL, INSERT_VALUES, xCoord));
+
+    PetscCall(DMGetLocalVector(dm, &localXCoord));
+    PetscCall(DMGlobalToLocal(dm, xCoord, INSERT_VALUES, localXCoord));
+    PetscCall(DMGetLocalSection(dm, &section));
+    PetscCall(DMPlexVecGetClosure(dm, section, localXCoord, 0, &closureSize, &u_e));
+
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: cell 0 closure of projected X-coordinate (nd=%" PetscInt_FMT
+      ", closureSize=%" PetscInt_FMT "):\n", nd, closureSize));
+    for (iz = 0; iz < nd; ++iz) {
+      for (iy = 0; iy < nd; ++iy) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  iz=%" PetscInt_FMT " iy=%" PetscInt_FMT ": ", iz, iy));
+        for (ix = 0; ix < nd; ++ix) {
+          PetscInt idx = (iz * nd + iy) * nd + ix;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%7.4f ",
+            (double)PetscRealPart(u_e[idx])));
+        }
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+      }
+    }
+
+    PetscCall(DMPlexVecRestoreClosure(dm, section, localXCoord, 0, &closureSize, &u_e));
+    PetscCall(DMRestoreLocalVector(dm, &localXCoord));
+    PetscCall(VecDestroy(&xCoord));
   }
 
   /* Initialize x with a nontrivial function */
