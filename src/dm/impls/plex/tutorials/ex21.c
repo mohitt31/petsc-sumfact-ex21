@@ -634,6 +634,79 @@ int main(int argc, char **argv)
     PetscCall(PetscFree6(uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk));
   }
 
+  /* DIAGNOSTIC: reference-element stiffness symmetry test, isolating
+     GradT3D and its consistency with Grad3D as true transposes of each
+     other -- fully decoupled from PETSc's mesh, closure, and geometry.
+     Build the reference (identity-metric, weight-only) local stiffness
+     action K_ref(u) = GradT3D( w .* Grad3D(u) ), apply it to each unit
+     basis vector to form the full nd^3 x nd^3 matrix, and check it is
+     symmetric -- a mathematical requirement for any correct Galerkin
+     discretization of the (self-adjoint) Laplacian, regardless of mesh
+     or physics. Grad3D itself is already proven correct (previous
+     diagnostic), so a failure here isolates the bug to GradT3D
+     specifically or to how Grad3D's output is wired into it. */
+  if (ctx.verify) {
+    PetscInt     nd = basis.nd, nq = basis.nq, nd3 = nd * nd * nd, nq3 = nq * nq * nq;
+    PetscScalar *Kref, *u_e, *y_e, *Gx, *Gy, *Gz, *t1, *t2, *acc;
+    PetscInt     p, kk, qidx, q1, q2, q3;
+    PetscReal    maxAsym = 0.0;
+
+    PetscCall(PetscMalloc1(nd3 * nd3, &Kref));
+    PetscCall(PetscCalloc6(nq3, &Gx, nq3, &Gy, nq3, &Gz, nq3, &t1, nq3, &t2, nd3, &acc));
+    PetscCall(PetscMalloc2(nd3, &u_e, nd3, &y_e));
+
+    for (p = 0; p < nd3; ++p) {
+      for (kk = 0; kk < nd3; ++kk) u_e[kk] = (kk == p) ? 1.0 : 0.0;
+
+      Grad3D(basis.B, basis.D, nq, nd, u_e, Gx, Gy, Gz, t1, t2);
+      for (qidx = 0; qidx < nq3; ++qidx) {
+        PetscReal w;
+        q1 = qidx / (nq * nq);
+        q2 = (qidx / nq) % nq;
+        q3 = qidx % nq;
+        w  = basis.w[q1] * basis.w[q2] * basis.w[q3];
+        Gx[qidx] *= w;
+        Gy[qidx] *= w;
+        Gz[qidx] *= w;
+      }
+      GradT3D(basis.Bt, basis.Dt, nq, nd, Gx, Gy, Gz, y_e, t1, t2, acc);
+
+      for (kk = 0; kk < nd3; ++kk) Kref[p * nd3 + kk] = y_e[kk];
+    }
+
+    for (p = 0; p < nd3; ++p) {
+      for (qidx = 0; qidx < nd3; ++qidx) {
+        PetscReal diff = PetscAbsReal(PetscRealPart(Kref[p * nd3 + qidx] - Kref[qidx * nd3 + p]));
+        maxAsym = PetscMax(maxAsym, diff);
+      }
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: reference stiffness symmetry test: max|K[p][q]-K[q][p]| = %e (want ~1e-14)\n",
+      (double)maxAsym));
+
+    PetscCall(PetscFree(Kref));
+    PetscCall(PetscFree6(Gx, Gy, Gz, t1, t2, acc));
+    PetscCall(PetscFree2(u_e, y_e));
+  }
+
+  /* DIAGNOSTIC: raw cell-0 geometry dump, in case the symmetry test
+     above passes and the remaining bug is a scalar geometry/physics
+     issue (wrong power of detJ, J/invJ confusion) rather than an
+     indexing issue. */
+  if (ctx.verify) {
+    PetscReal v0[3], J[9], invJ[9], detJ;
+    PetscInt  ii;
+
+    PetscCall(DMPlexComputeCellGeometryFEM(dm, 0, NULL, v0, J, invJ, &detJ));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 detJ=%e\n", (double)detJ));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 J    = "));
+    for (ii = 0; ii < 9; ++ii) PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%9.5f ", (double)J[ii]));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 invJ = "));
+    for (ii = 0; ii < 9; ++ii) PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%9.5f ", (double)invJ[ii]));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+  }
+
   /* DIAGNOSTIC: project physical X-coordinate onto the field, then dump
      cell 0's closure array decoded via our assumed flat-index formula
      idx = iz*nd*nd + iy*nd + ix (ix fastest). Since the projected value
