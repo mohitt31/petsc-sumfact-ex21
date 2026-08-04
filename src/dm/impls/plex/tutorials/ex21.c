@@ -121,6 +121,70 @@ static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
     }
   }
 
+  /* Reorder basis-function index from PETSc's internal FE-tabulation
+     order into lexicographic (ascending physical-position) order, to
+     match the order DMPlexVecGetClosure returns after
+     DMPlexSetClosurePermutationTensor is applied. These two orders are
+     NOT the same: empirically, PETSc's native FE tabulation index for a
+     degree-2 element puts the interior/center node at index 0 and the
+     vertices at indices 1,2, while the tensor-permuted closure array
+     returns vertex(left), interior(center), vertex(right) in that
+     lexicographic order. Without this correction, B1d/D1d and the
+     closure array u_e disagree on what index i means, producing a
+     result that is internally self-consistent but wrong relative to
+     PETSc's own reference assembly.
+
+     The permutation is found generically (works for any degree): each
+     1D Lagrange basis function attains its largest value at the
+     quadrature point nearest its own node, so sorting basis indices by
+     argmax_q(B1d[q][i]) recovers position order without needing to know
+     PETSc's internal native ordering convention analytically. */
+  {
+    PetscInt  *permNativeOfLex, *peakQ;
+    PetscReal *newB, *newD;
+    PetscInt   ii, qq;
+
+    PetscCall(PetscMalloc2(nd, &permNativeOfLex, nd, &peakQ));
+    for (ii = 0; ii < nd; ++ii) {
+      PetscInt  bestQ   = 0;
+      PetscReal bestVal = b->B[0 * nd + ii];
+      for (qq = 1; qq < nq; ++qq) {
+        if (b->B[qq * nd + ii] > bestVal) { bestVal = b->B[qq * nd + ii]; bestQ = qq; }
+      }
+      peakQ[ii]           = bestQ;
+      permNativeOfLex[ii] = ii;
+    }
+    /* Selection sort native indices by ascending peakQ */
+    for (ii = 0; ii < nd - 1; ++ii) {
+      PetscInt minIdx = ii, jj, tmp;
+      for (jj = ii + 1; jj < nd; ++jj) {
+        if (peakQ[permNativeOfLex[jj]] < peakQ[permNativeOfLex[minIdx]]) minIdx = jj;
+      }
+      tmp                    = permNativeOfLex[ii];
+      permNativeOfLex[ii]    = permNativeOfLex[minIdx];
+      permNativeOfLex[minIdx] = tmp;
+    }
+
+    PetscCall(PetscMalloc2(nq * nd, &newB, nq * nd, &newD));
+    for (qq = 0; qq < nq; ++qq) {
+      for (ii = 0; ii < nd; ++ii) {
+        PetscInt nativeI    = permNativeOfLex[ii];
+        newB[qq * nd + ii] = b->B[qq * nd + nativeI];
+        newD[qq * nd + ii] = b->D[qq * nd + nativeI];
+      }
+    }
+    PetscCall(PetscArraycpy(b->B, newB, nq * nd));
+    PetscCall(PetscArraycpy(b->D, newD, nq * nd));
+    for (qq = 0; qq < nq; ++qq) {
+      for (ii = 0; ii < nd; ++ii) {
+        b->Bt[ii * nq + qq] = b->B[qq * nd + ii];
+        b->Dt[ii * nq + qq] = b->D[qq * nd + ii];
+      }
+    }
+    PetscCall(PetscFree2(newB, newD));
+    PetscCall(PetscFree2(permNativeOfLex, peakQ));
+  }
+
   /* Extract 1D quadrature weights from the 3D quadrature.
      w3D[(q1*nq+q2)*nq+q3] = w1d[q1]*w1d[q2]*w1d[q3]
      At q1=0,q2=0: w3D[q3] = w1d[0]^2 * w1d[q3]
