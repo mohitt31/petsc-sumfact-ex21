@@ -634,6 +634,62 @@ int main(int argc, char **argv)
     PetscCall(PetscFree6(uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk));
   }
 
+  /* DIAGNOSTIC: isolated, mesh-independent unit test of
+     LaplacianPointwise's metric-tensor formula, using a SYNTHETIC
+     non-diagonal invJ. All prior geometry tests used axis-aligned
+     box-mesh cells, which always produce DIAGONAL Jacobians -- diagonal
+     matrices are transpose-invariant, so a transpose-convention bug in
+     the metric-tensor formula would be COMPLETELY INVISIBLE in every
+     test run so far (isotropic or anisotropic), since axis-aligned box
+     meshes can never produce off-diagonal J/invJ. This test uses a
+     hand-picked non-diagonal invJ to finally exercise that case.
+
+     For ANY invJ, gradX_u . gradX_phi (computed by transforming BOTH
+     reference gradients to physical space via
+     gradX[d] = sum_a invJ[a*dim+d] * gradXi[a], then dotting) must
+     equal dot(LaplacianPointwise(gradXi_u, invJ, ...), gradXi_phi) --
+     since LaplacianPointwise's "res" is meant to be a pre-metric-
+     contracted vector such that dot(res, grad_xi(phi)) equals the
+     physical dot product for ANY phi. If these disagree, the bug is in
+     LaplacianPointwise's G_dk formula (transpose or index-order error),
+     not in geometry extraction, closure, or the tensor-contraction
+     algorithm (all already proven correct). */
+  if (ctx.verify) {
+    PetscReal   invJSyn[9] = {1.0, 0.5, 0.0,  0.0, 1.0, 0.3,  0.2, 0.0, 1.0};
+    PetscReal   gradXiU[3] = {1.0, 2.0, 3.0};
+    PetscReal   gradXiPhi[3] = {0.0, 1.0, 0.0};
+    PetscReal   gradXU[3], gradXPhi[3], trueVal;
+    PetscScalar res[3];
+    PetscReal   shortcutVal;
+    PetscInt    a, d;
+
+    for (d = 0; d < 3; ++d) {
+      gradXU[d] = 0.0;
+      gradXPhi[d] = 0.0;
+      for (a = 0; a < 3; ++a) {
+        gradXU[d]   += invJSyn[a * 3 + d] * gradXiU[a];
+        gradXPhi[d] += invJSyn[a * 3 + d] * gradXiPhi[a];
+      }
+    }
+    trueVal = gradXU[0] * gradXPhi[0] + gradXU[1] * gradXPhi[1] + gradXU[2] * gradXPhi[2];
+
+    {
+      PetscScalar gradIn[3];
+      gradIn[0] = gradXiU[0];
+      gradIn[1] = gradXiU[1];
+      gradIn[2] = gradXiU[2];
+      LaplacianPointwise(3, gradIn, invJSyn, 1.0, 1.0, res);
+    }
+    shortcutVal = PetscRealPart(res[0]) * gradXiPhi[0]
+                + PetscRealPart(res[1]) * gradXiPhi[1]
+                + PetscRealPart(res[2]) * gradXiPhi[2];
+
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: metric-tensor unit test (synthetic non-diagonal invJ): "
+      "trueVal=%.6f shortcutVal=%.6f diff=%.6e\n",
+      (double)trueVal, (double)shortcutVal, (double)PetscAbsReal(trueVal - shortcutVal)));
+  }
+
   /* DIAGNOSTIC: reference-element stiffness symmetry test, isolating
      GradT3D and its consistency with Grad3D as true transposes of each
      other -- fully decoupled from PETSc's mesh, closure, and geometry.
