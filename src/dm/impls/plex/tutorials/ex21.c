@@ -586,6 +586,54 @@ int main(int argc, char **argv)
     PetscCall(VecDestroy(&yConst));
   }
 
+  /* DIAGNOSTIC: reference-element gradient test, fully decoupled from
+     PETSc's mesh, closure ordering, and geometry -- tests ONLY the core
+     tensor-contraction algorithm (Contract1D/TransposeInner/RotateOuter/
+     Grad3D). Build the nodal interpolant of the reference coordinate
+     function f(xi,eta,zeta)=xi directly: nodal Lagrange interpolation
+     represents this EXACTLY, since the value at node (ix,iy,iz) is just
+     that node's own xi-coordinate, nodes1d[ix]. Grad3D applied to this
+     must recover the exactly-known analytical answer grad(xi)=(1,0,0)
+     at every quadrature point. If this fails, the bug is in Grad3D's
+     tensor-contraction structure itself, not in the basis, geometry, or
+     closure ordering (all already verified/ruled out). */
+  if (ctx.verify) {
+    PetscReal   *nodes1dChk, *gllwChk;
+    PetscScalar *uRef, *GxChk, *GyChk, *GzChk, *t1Chk, *t2Chk;
+    PetscInt     nd = basis.nd, nq = basis.nq;
+    PetscInt     ix, iy, iz, q;
+    PetscReal    maxErrGx = 0.0, maxErrGy = 0.0, maxErrGz = 0.0;
+
+    PetscCall(PetscMalloc2(nd, &nodes1dChk, nd, &gllwChk));
+    PetscCall(PetscDTGaussLobattoLegendreQuadrature(nd, PETSCGAUSSLOBATTOLEGENDRE_VIA_LINEAR_ALGEBRA, nodes1dChk, gllwChk));
+
+    PetscCall(PetscCalloc6(nd * nd * nd, &uRef,
+                           nq * nq * nq, &GxChk, nq * nq * nq, &GyChk,
+                           nq * nq * nq, &GzChk, nq * nq * nq, &t1Chk,
+                           nq * nq * nq, &t2Chk));
+    for (iz = 0; iz < nd; ++iz) {
+      for (iy = 0; iy < nd; ++iy) {
+        for (ix = 0; ix < nd; ++ix) {
+          uRef[(iz * nd + iy) * nd + ix] = nodes1dChk[ix];
+        }
+      }
+    }
+
+    Grad3D(basis.B, basis.D, nq, nd, uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk);
+
+    for (q = 0; q < nq * nq * nq; ++q) {
+      maxErrGx = PetscMax(maxErrGx, PetscAbsReal(PetscRealPart(GxChk[q]) - 1.0));
+      maxErrGy = PetscMax(maxErrGy, PetscAbsReal(PetscRealPart(GyChk[q])));
+      maxErrGz = PetscMax(maxErrGz, PetscAbsReal(PetscRealPart(GzChk[q])));
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "DIAGNOSTIC: reference grad(xi) test: maxErr Gx(want~0)=%e Gy(want~0)=%e Gz(want~0)=%e\n",
+      (double)maxErrGx, (double)maxErrGy, (double)maxErrGz));
+
+    PetscCall(PetscFree2(nodes1dChk, gllwChk));
+    PetscCall(PetscFree6(uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk));
+  }
+
   /* DIAGNOSTIC: project physical X-coordinate onto the field, then dump
      cell 0's closure array decoded via our assumed flat-index formula
      idx = iz*nd*nd + iy*nd + ix (ix fastest). Since the projected value
