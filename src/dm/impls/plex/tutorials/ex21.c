@@ -782,6 +782,34 @@ int main(int argc, char **argv)
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "Verification: ||y_sf - y_ref|| / ||y_ref|| = %e\n",
       (double)(norm_ref > 0 ? norm_diff / norm_ref : norm_diff)));
+
+    /* DIAGNOSTIC: raw side-by-side dump of y_sf vs y_ref, to spot a
+       pattern (sign flip, constant scale factor, or permutation) that
+       the aggregate relative-error number hides. Only dump for small
+       problems (global size <= 200) to keep output readable. */
+    {
+      PetscInt N;
+      PetscCall(VecGetSize(y_sf, &N));
+      if (N <= 200) {
+        const PetscScalar *sfArr, *refArr;
+        PetscInt k;
+        PetscCall(VecGetArrayRead(y_sf, &sfArr));
+        PetscCall(VecGetArrayRead(y_ref, &refArr));
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "DIAGNOSTIC: raw y_sf vs y_ref (N=%" PetscInt_FMT "):\n", N));
+        for (k = 0; k < N; ++k) {
+          PetscReal sfv = PetscRealPart(sfArr[k]);
+          PetscReal refv = PetscRealPart(refArr[k]);
+          PetscReal ratio = (PetscAbsReal(refv) > 1e-14) ? sfv / refv : 0.0;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "  k=%" PetscInt_FMT ": y_sf=%10.6f  y_ref=%10.6f  ratio=%8.4f\n",
+            k, (double)sfv, (double)refv, (double)ratio));
+        }
+        PetscCall(VecRestoreArrayRead(y_sf, &sfArr));
+        PetscCall(VecRestoreArrayRead(y_ref, &refArr));
+      }
+    }
+
     PetscCall(VecDestroy(&diff));
   }
 
