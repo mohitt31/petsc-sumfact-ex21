@@ -27,6 +27,7 @@ callbacks, verified against PetscFE's standard tabulation path.\n\n";
 #include <petscdmplex.h>
 #include <petscds.h>
 #include <petscfe.h>
+#include <petscdt.h>
 
 /* ------------------------------------------------------------------- */
 /*  Application context                                                 */
@@ -75,22 +76,25 @@ typedef struct {
 */
 static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
 {
-  PetscTabulation tab;
-  PetscInt        Nb, Nq, nd, nq, q, i;
-  PetscReal       norm;
+  PetscSpace sp;
+  PetscInt   degree, nd, nq, q, i, j;
+  PetscReal *nodes1d, *gllw1d, *qpts1d, *qwts1d;
 
   PetscFunctionBeginUser;
-  PetscCall(PetscFEGetCellTabulation(fe, 1, &tab));
-  Nb = tab->Nb;
-  Nq = tab->Np;
-
-  /* Cube root to get 1D sizes */
-  for (nd = 1; nd * nd * nd != Nb && nd < 100; ++nd);
-  PetscCheck(nd * nd * nd == Nb, PETSC_COMM_SELF, PETSC_ERR_SUP,
-    "Nb=%" PetscInt_FMT " is not a perfect cube", Nb);
-  for (nq = 1; nq * nq * nq != Nq && nq < 100; ++nq);
-  PetscCheck(nq * nq * nq == Nq, PETSC_COMM_SELF, PETSC_ERR_SUP,
-    "Nq=%" PetscInt_FMT " is not a perfect cube", Nq);
+  /* Get polynomial degree directly from the FE's basis space -- this is
+     the ONLY thing we need from the FE object. We no longer extract
+     anything from PETSc's internal tabulation (tab->T[0]), because that
+     tabulation's basis-function index order does not match the
+     tensor-permuted closure array's lexicographic order (empirically
+     proven via the X-coordinate projection diagnostic, round 4), and
+     attempting to reorder it via argmax-sorting (round 5) introduced a
+     real bug (duplicate columns for degree > 2, visible as broken
+     partition-of-unity). Constructing the basis independently sidesteps
+     the entire class of ordering bugs. */
+  PetscCall(PetscFEGetBasisSpace(fe, &sp));
+  PetscCall(PetscSpaceGetDegree(sp, &degree, NULL));
+  nd = degree + 1;
+  nq = nd + 1; /* CEED q=p+2 over-integration convention */
 
   b->nd = nd;
   b->nq = nq;
@@ -100,126 +104,66 @@ static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
                          nd * nq, &b->Dt,
                          nq,      &b->w));
 
-  /* Extract 1D basis from 3D tabulation.
-     B3D[0][0] = B1d[0][0]^3, so B1d[0][0] = cbrt(B3D[0][0]).
-     B3D[q3][i3] = B1d[0][0]^2 * B1d[q3][i3] at q1=q2=0, i1=i2=0.
-     Therefore B1d[q][i] = B3D[q][i] / B1d[0][0]^2 = B3D[q][i] / cbrt(B3D[0][0])^2 */
-  {
-    PetscReal b3d00 = tab->T[0][0];
-    PetscCheck(PetscAbsReal(b3d00) > 1.0e-14, PETSC_COMM_SELF, PETSC_ERR_ARG_INCOMP,
-      "B3D[0][0] is zero; basis is not tensor-product with nonzero B1d[0][0]");
-    norm = PetscPowReal(PetscAbsReal(b3d00), 2.0 / 3.0);
-    if (b3d00 < 0) norm = -norm; /* preserve sign */
-  }
+  /* 1D GLL interpolation nodes on [-1,1], returned in ascending order.
+     This matches PETSc's default Lagrange dual space node type --
+     verified empirically: for a degree-4 element, the physical DOF
+     positions measured via the X-coordinate closure diagnostic matched
+     the standard GLL-5 reference nodes {-1, -0.6547, 0, 0.6547, 1} to
+     high precision, not the equispaced nodes {-1,-0.5,0,0.5,1}. */
+  PetscCall(PetscMalloc2(nd, &nodes1d, nd, &gllw1d));
+  PetscCall(PetscDTGaussLobattoLegendreQuadrature(nd, PETSCGAUSSLOBATTOLEGENDRE_VIA_LINEAR_ALGEBRA, nodes1d, gllw1d));
+
+  /* 1D Gauss-Legendre quadrature on [-1,1], also ascending order. This is
+     independent of whatever quadrature rule PETSc's FE object uses
+     internally: any Gauss rule accurate enough to exactly integrate the
+     stiffness-matrix integrand's polynomial degree gives the identical
+     (machine-precision) result on this affine mesh, so matching PETSc's
+     internal quadrature choice exactly is not required. */
+  PetscCall(PetscMalloc2(nq, &qpts1d, nq, &qwts1d));
+  PetscCall(PetscDTGaussQuadrature(nq, -1.0, 1.0, qpts1d, qwts1d));
+
+  /* Evaluate the degree-(nd-1) Lagrange basis defined by nodes1d, and its
+     derivative, at each quadrature point via the standard formula:
+       L_i(x)  = prod_{j!=i} (x - x_j) / (x_i - x_j)
+       L_i'(x) = L_i(x) * sum_{j!=i} 1/(x - x_j)
+     Both nodes1d and qpts1d are independently known to be in ascending
+     physical order, so basis index i and quadrature index q both
+     correspond directly to ascending position -- matching the proven
+     lexicographic order of the closure array with no further reordering
+     needed. */
   for (q = 0; q < nq; ++q) {
+    PetscReal x = qpts1d[q];
     for (i = 0; i < nd; ++i) {
-      b->B[q * nd + i]  = tab->T[0][q * Nb + i] / norm;
-      /* Derivative: component 2 (z-direction) of the gradient */
-      b->D[q * nd + i]  = tab->T[1][(q * Nb + i) * 3 + 2] / norm;
+      PetscReal Li = 1.0, dsum = 0.0;
+
+      for (j = 0; j < nd; ++j) {
+        if (j == i) continue;
+        Li   *= (x - nodes1d[j]) / (nodes1d[i] - nodes1d[j]);
+        dsum += 1.0 / (x - nodes1d[j]);
+      }
+      b->B[q * nd + i]  = Li;
+      b->D[q * nd + i]  = Li * dsum;
       b->Bt[i * nq + q] = b->B[q * nd + i];
       b->Dt[i * nq + q] = b->D[q * nd + i];
     }
+    b->w[q] = qwts1d[q];
   }
 
-  /* Reorder basis-function index from PETSc's internal FE-tabulation
-     order into lexicographic (ascending physical-position) order, to
-     match the order DMPlexVecGetClosure returns after
-     DMPlexSetClosurePermutationTensor is applied. These two orders are
-     NOT the same: empirically, PETSc's native FE tabulation index for a
-     degree-2 element puts the interior/center node at index 0 and the
-     vertices at indices 1,2, while the tensor-permuted closure array
-     returns vertex(left), interior(center), vertex(right) in that
-     lexicographic order. Without this correction, B1d/D1d and the
-     closure array u_e disagree on what index i means, producing a
-     result that is internally self-consistent but wrong relative to
-     PETSc's own reference assembly.
+  PetscCall(PetscFree2(nodes1d, gllw1d));
+  PetscCall(PetscFree2(qpts1d, qwts1d));
 
-     The permutation is found generically (works for any degree): each
-     1D Lagrange basis function attains its largest value at the
-     quadrature point nearest its own node, so sorting basis indices by
-     argmax_q(B1d[q][i]) recovers position order without needing to know
-     PETSc's internal native ordering convention analytically. */
-  {
-    PetscInt  *permNativeOfLex, *peakQ;
-    PetscReal *newB, *newD;
-    PetscInt   ii, qq;
-
-    PetscCall(PetscMalloc2(nd, &permNativeOfLex, nd, &peakQ));
-    for (ii = 0; ii < nd; ++ii) {
-      PetscInt  bestQ   = 0;
-      PetscReal bestVal = b->B[0 * nd + ii];
-      for (qq = 1; qq < nq; ++qq) {
-        if (b->B[qq * nd + ii] > bestVal) { bestVal = b->B[qq * nd + ii]; bestQ = qq; }
-      }
-      peakQ[ii]           = bestQ;
-      permNativeOfLex[ii] = ii;
-    }
-    /* Selection sort native indices by ascending peakQ */
-    for (ii = 0; ii < nd - 1; ++ii) {
-      PetscInt minIdx = ii, jj, tmp;
-      for (jj = ii + 1; jj < nd; ++jj) {
-        if (peakQ[permNativeOfLex[jj]] < peakQ[permNativeOfLex[minIdx]]) minIdx = jj;
-      }
-      tmp                    = permNativeOfLex[ii];
-      permNativeOfLex[ii]    = permNativeOfLex[minIdx];
-      permNativeOfLex[minIdx] = tmp;
-    }
-
-    PetscCall(PetscMalloc2(nq * nd, &newB, nq * nd, &newD));
-    for (qq = 0; qq < nq; ++qq) {
-      for (ii = 0; ii < nd; ++ii) {
-        PetscInt nativeI    = permNativeOfLex[ii];
-        newB[qq * nd + ii] = b->B[qq * nd + nativeI];
-        newD[qq * nd + ii] = b->D[qq * nd + nativeI];
-      }
-    }
-    PetscCall(PetscArraycpy(b->B, newB, nq * nd));
-    PetscCall(PetscArraycpy(b->D, newD, nq * nd));
-    for (qq = 0; qq < nq; ++qq) {
-      for (ii = 0; ii < nd; ++ii) {
-        b->Bt[ii * nq + qq] = b->B[qq * nd + ii];
-        b->Dt[ii * nq + qq] = b->D[qq * nd + ii];
-      }
-    }
-    PetscCall(PetscFree2(newB, newD));
-    PetscCall(PetscFree2(permNativeOfLex, peakQ));
-  }
-
-  /* Extract 1D quadrature weights from the 3D quadrature.
-     w3D[(q1*nq+q2)*nq+q3] = w1d[q1]*w1d[q2]*w1d[q3]
-     At q1=0,q2=0: w3D[q3] = w1d[0]^2 * w1d[q3]
-     So w1d[q3] = w3D[q3] / w3D[0] * w1d[0], and w1d[0] = cbrt(w3D[0]) */
-  {
-    PetscQuadrature quad;
-    const PetscReal *wts;
-    PetscInt         nq_check;
-    PetscReal        w0;
-
-    PetscCall(PetscFEGetQuadrature(fe, &quad));
-    PetscCall(PetscQuadratureGetData(quad, NULL, NULL, &nq_check, NULL, &wts));
-    PetscCheck(nq_check == Nq, PETSC_COMM_SELF, PETSC_ERR_PLIB,
-      "Quadrature count mismatch");
-    w0 = PetscPowReal(wts[0], 1.0 / 3.0);
-    for (q = 0; q < nq; ++q) {
-      b->w[q] = wts[q] / (w0 * w0) ; /* w3D[q3] / w1d[0]^2 */
-    }
-    /* Verify: w1d[0] should equal w0 */
-  }
   /* DIAGNOSTIC: Lagrange basis functions must sum to 1.0 at every point
-     (partition of unity), and their derivatives must sum to 0.0 (derivative
-     of the constant function 1). These properties hold regardless of node
-     type (equispaced, GLL, etc.) or axis-ordering convention. If either
-     check fails, the extraction indexing assumption below is wrong,
-     independent of closure ordering, geometry, or physics. */
+     (partition of unity), and their derivatives must sum to 0.0. These
+     hold for any correct Lagrange basis regardless of node type. */
   {
-    PetscInt  q, i;
+    PetscInt  qq, ii;
     PetscReal maxErrB = 0.0, maxErrD = 0.0;
 
-    for (q = 0; q < nq; ++q) {
+    for (qq = 0; qq < nq; ++qq) {
       PetscReal sumB = 0.0, sumD = 0.0;
-      for (i = 0; i < nd; ++i) {
-        sumB += b->B[q * nd + i];
-        sumD += b->D[q * nd + i];
+      for (ii = 0; ii < nd; ++ii) {
+        sumB += b->B[qq * nd + ii];
+        sumD += b->D[qq * nd + ii];
       }
       maxErrB = PetscMax(maxErrB, PetscAbsReal(sumB - 1.0));
       maxErrD = PetscMax(maxErrD, PetscAbsReal(sumD));
@@ -232,10 +176,10 @@ static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
       (double)maxErrD));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: raw B1d[q][i] matrix (nq=%"
       PetscInt_FMT " x nd=%" PetscInt_FMT "):\n", nq, nd));
-    for (q = 0; q < nq; ++q) {
-      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  q=%" PetscInt_FMT ": ", q));
-      for (i = 0; i < nd; ++i) {
-        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%8.5f ", (double)b->B[q * nd + i]));
+    for (qq = 0; qq < nq; ++qq) {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  q=%" PetscInt_FMT ": ", qq));
+      for (ii = 0; ii < nd; ++ii) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%8.5f ", (double)b->B[qq * nd + ii]));
       }
       PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
     }
