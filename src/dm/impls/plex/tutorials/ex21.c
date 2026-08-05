@@ -1,23 +1,28 @@
 static char help[] = "Sum-factorized matrix-free Laplacian on hexahedral meshes.\n\
 Demonstrates tensor-product sum-factorization for operator evaluation\n\
-on 3D hex meshes with user-customizable pointwise physics via PetscDS\n\
-callbacks, verified against PetscFE's standard tabulation path.\n\n";
+on 3D hex meshes, with user-customizable pointwise physics via a\n\
+function pointer in the spirit of PetscDS callbacks / libCEED\n\
+QFunctions. Verified against a dense (non-factorized) reference built\n\
+from the same basis.\n\n";
 
 /*
   Sum-factorization tutorial for hexahedral elements.
 
   Algorithm: Kronbichler & Kormann, ACM TOMS 38(2), 2012.
-  User kernel pattern: Knepley, Brown, Rupp & Smith, 2013
+  Kernel interface pattern: Knepley, Brown, Rupp & Smith, 2013
     ("Achieving High Performance with Unified Residual Evaluation").
 
   The operator action y = A*x for the weak Laplacian is decomposed as:
-    y_e = G^T B^T D B G x_e
-  where G is element gather/scatter, B is sum-factorized basis evaluation,
-  and D is the pointwise quadrature operation (geometry + physics).
+    y_e = G^T D(phi) B G x_e
+  where G is element gather/scatter, B/D are sum-factorized 1D basis
+  interpolation/differentiation matrices, and the pointwise physics
+  (here, the geometric metric tensor for the Laplacian) is applied at
+  each quadrature point via a user-replaceable function pointer.
 
   This file is portable C (C90). No SIMD intrinsics. Headline speedup
   numbers from the standalone repo (github.com/mohitt31/mf-kernels)
-  require AVX2 on x86 and are not reproduced by this portable version.
+  require AVX2 on x86 and are not reproduced by this portable version;
+  see the README in that repo for hardware-specific benchmarks.
 
   Build:  make ex21  (with PETSC_DIR / PETSC_ARCH set)
   Run:    ./ex21 -dm_plex_simplex 0 -dm_plex_box_faces 4,4,4 \
@@ -38,20 +43,8 @@ typedef struct {
   PetscInt  niter;
 } AppCtx;
 
-/* DIAGNOSTIC: project the physical X-coordinate onto the FE space.
-   Used to empirically determine the closure array's flat-index-to-axis
-   mapping: since the projected field's DOF value at any node equals that
-   node's physical X-coordinate, printing the closure array reveals
-   exactly which flat index varies with X, Y, and Z. */
-static PetscErrorCode CoordXFunc(PetscInt dim, PetscReal time, const PetscReal xc[],
-                                 PetscInt Nc, PetscScalar *u, void *ctx)
-{
-  u[0] = xc[0];
-  return 0;
-}
-
 /* ------------------------------------------------------------------- */
-/*  1D basis and even-odd precomputation                                */
+/*  1D basis: values, derivatives, and quadrature weights               */
 /* ------------------------------------------------------------------- */
 typedef struct {
   PetscInt   nd;        /* 1D DOF count = degree + 1                    */
@@ -63,38 +56,77 @@ typedef struct {
   PetscReal *w;         /* 1D quad wts [nq]                             */
 } Basis1D;
 
+/* Numerically robust evaluation of Lagrange basis function i (defined
+   by nd nodes in nodes1d) and its derivative, at point x. Handles the
+   case where x coincides with another node (j!=i): the naive
+   log-derivative formula L_i(x)*sum(1/(x-x_j)) is a 0*infinity
+   indeterminate form exactly at such points, which arises whenever the
+   quadrature point count matches PETSc's own default (collocated with
+   a symmetric node such as x=0). */
+static void LagrangeEval1D(const PetscReal *nodes1d, PetscInt nd, PetscReal x,
+                           PetscInt i, PetscReal *Lval, PetscReal *Dval)
+{
+  PetscReal Li = 1.0, dsum = 0.0;
+  PetscInt  j, coincideIdx = -1;
+
+  for (j = 0; j < nd; ++j) {
+    if (j == i) continue;
+    PetscReal diff = x - nodes1d[j];
+    if (PetscAbsReal(diff) < 1.0e-12) coincideIdx = j;
+    Li *= diff / (nodes1d[i] - nodes1d[j]);
+  }
+  if (coincideIdx < 0) {
+    for (j = 0; j < nd; ++j) {
+      if (j == i) continue;
+      dsum += 1.0 / (x - nodes1d[j]);
+    }
+    *Lval = Li;
+    *Dval = Li * dsum;
+  } else {
+    PetscReal num = 1.0, den = 1.0;
+    PetscInt  k = coincideIdx;
+    for (j = 0; j < nd; ++j) {
+      if (j == i) continue;
+      den *= (nodes1d[i] - nodes1d[j]);
+      if (j == k) continue;
+      num *= (nodes1d[k] - nodes1d[j]);
+    }
+    *Lval = 0.0;
+    *Dval = num / den;
+  }
+}
+
 /*
-  Extract 1D basis data from PetscFE's tensor-product tabulation.
-
-  For a tensor-product element on a hex, the 3D basis is:
-    B3D[(q1*nq+q2)*nq+q3][(i1*nd+i2)*nd+i3] = B1d[q1][i1] * B1d[q2][i2] * B1d[q3][i3]
-
-  We extract B1d by reading the slice q1=0,q2=0,i1=0,i2=0:
-    B3D[q3][i3] = B1d[0][0]^2 * B1d[q3][i3]
-
-  Then normalize by B1d[0][0]^2 = B3D[0][0].
+  Build the 1D basis from PETSc's own GLL node type and the FE's own
+  quadrature point count (matched dynamically via PetscFEGetQuadrature,
+  rather than an independently-chosen over-integration order), so that
+  the resulting sum-factorized operator uses the identical quadrature
+  PETSc itself uses internally.
 */
 static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
 {
-  PetscSpace sp;
-  PetscInt   degree, nd, nq, q, i, j;
-  PetscReal *nodes1d, *gllw1d, *qpts1d, *qwts1d;
+  PetscSpace       sp;
+  PetscQuadrature  quad;
+  PetscInt         degree, nd, nq, nqTotal, q, i;
+  PetscReal       *nodes1d, *gllw1d, *qpts1d, *qwts1d;
 
   PetscFunctionBeginUser;
-  /* Get polynomial degree directly from the FE's basis space -- this is
-     the ONLY thing we need from the FE object. We no longer extract
-     anything from PETSc's internal tabulation (tab->T[0]), because that
-     tabulation's basis-function index order does not match the
-     tensor-permuted closure array's lexicographic order (empirically
-     proven via the X-coordinate projection diagnostic, round 4), and
-     attempting to reorder it via argmax-sorting (round 5) introduced a
-     real bug (duplicate columns for degree > 2, visible as broken
-     partition-of-unity). Constructing the basis independently sidesteps
-     the entire class of ordering bugs. */
   PetscCall(PetscFEGetBasisSpace(fe, &sp));
   PetscCall(PetscSpaceGetDegree(sp, &degree, NULL));
   nd = degree + 1;
-  nq = nd + 1; /* CEED q=p+2 over-integration convention */
+
+  /* Match the FE's own quadrature point count exactly (cube root of its
+     total point count), rather than independently choosing an
+     over-integration order: two different quadrature rules can both be
+     individually "sufficient" by polynomial-degree exactness counting
+     yet still disagree numerically if their node sets differ, so this
+     example matches PETSc's own choice to guarantee bit-for-bit
+     agreement with PETSc's internal assembly. */
+  PetscCall(PetscFEGetQuadrature(fe, &quad));
+  PetscCall(PetscQuadratureGetData(quad, NULL, NULL, &nqTotal, NULL, NULL));
+  for (nq = 1; nq * nq * nq != nqTotal && nq < 100; ++nq);
+  PetscCheck(nq * nq * nq == nqTotal, PETSC_COMM_SELF, PETSC_ERR_SUP,
+    "FE quadrature point count %" PetscInt_FMT " is not a perfect cube", nqTotal);
 
   b->nd = nd;
   b->nq = nq;
@@ -104,87 +136,30 @@ static PetscErrorCode Basis1DCreate(PetscFE fe, Basis1D *b)
                          nd * nq, &b->Dt,
                          nq,      &b->w));
 
-  /* 1D GLL interpolation nodes on [-1,1], returned in ascending order.
-     This matches PETSc's default Lagrange dual space node type --
-     verified empirically: for a degree-4 element, the physical DOF
-     positions measured via the X-coordinate closure diagnostic matched
-     the standard GLL-5 reference nodes {-1, -0.6547, 0, 0.6547, 1} to
-     high precision, not the equispaced nodes {-1,-0.5,0,0.5,1}. */
+  /* 1D GLL interpolation nodes on [-1,1] (ascending order), matching
+     PETSc's default Lagrange dual space node type. */
   PetscCall(PetscMalloc2(nd, &nodes1d, nd, &gllw1d));
   PetscCall(PetscDTGaussLobattoLegendreQuadrature(nd, PETSCGAUSSLOBATTOLEGENDRE_VIA_LINEAR_ALGEBRA, nodes1d, gllw1d));
 
-  /* 1D Gauss-Legendre quadrature on [-1,1], also ascending order. This is
-     independent of whatever quadrature rule PETSc's FE object uses
-     internally: any Gauss rule accurate enough to exactly integrate the
-     stiffness-matrix integrand's polynomial degree gives the identical
-     (machine-precision) result on this affine mesh, so matching PETSc's
-     internal quadrature choice exactly is not required. */
+  /* 1D Gauss-Legendre quadrature on [-1,1] (ascending order), with a
+     point count matching PETSc's own choice (see above). */
   PetscCall(PetscMalloc2(nq, &qpts1d, nq, &qwts1d));
   PetscCall(PetscDTGaussQuadrature(nq, -1.0, 1.0, qpts1d, qwts1d));
 
-  /* Evaluate the degree-(nd-1) Lagrange basis defined by nodes1d, and its
-     derivative, at each quadrature point via the standard formula:
-       L_i(x)  = prod_{j!=i} (x - x_j) / (x_i - x_j)
-       L_i'(x) = L_i(x) * sum_{j!=i} 1/(x - x_j)
-     Both nodes1d and qpts1d are independently known to be in ascending
-     physical order, so basis index i and quadrature index q both
-     correspond directly to ascending position -- matching the proven
-     lexicographic order of the closure array with no further reordering
-     needed. */
   for (q = 0; q < nq; ++q) {
-    PetscReal x = qpts1d[q];
     for (i = 0; i < nd; ++i) {
-      PetscReal Li = 1.0, dsum = 0.0;
-
-      for (j = 0; j < nd; ++j) {
-        if (j == i) continue;
-        Li   *= (x - nodes1d[j]) / (nodes1d[i] - nodes1d[j]);
-        dsum += 1.0 / (x - nodes1d[j]);
-      }
-      b->B[q * nd + i]  = Li;
-      b->D[q * nd + i]  = Li * dsum;
-      b->Bt[i * nq + q] = b->B[q * nd + i];
-      b->Dt[i * nq + q] = b->D[q * nd + i];
+      PetscReal Lval, Dval;
+      LagrangeEval1D(nodes1d, nd, qpts1d[q], i, &Lval, &Dval);
+      b->B[q * nd + i]  = Lval;
+      b->D[q * nd + i]  = Dval;
+      b->Bt[i * nq + q] = Lval;
+      b->Dt[i * nq + q] = Dval;
     }
     b->w[q] = qwts1d[q];
   }
 
   PetscCall(PetscFree2(nodes1d, gllw1d));
   PetscCall(PetscFree2(qpts1d, qwts1d));
-
-  /* DIAGNOSTIC: Lagrange basis functions must sum to 1.0 at every point
-     (partition of unity), and their derivatives must sum to 0.0. These
-     hold for any correct Lagrange basis regardless of node type. */
-  {
-    PetscInt  qq, ii;
-    PetscReal maxErrB = 0.0, maxErrD = 0.0;
-
-    for (qq = 0; qq < nq; ++qq) {
-      PetscReal sumB = 0.0, sumD = 0.0;
-      for (ii = 0; ii < nd; ++ii) {
-        sumB += b->B[qq * nd + ii];
-        sumD += b->D[qq * nd + ii];
-      }
-      maxErrB = PetscMax(maxErrB, PetscAbsReal(sumB - 1.0));
-      maxErrD = PetscMax(maxErrD, PetscAbsReal(sumD));
-    }
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: partition-of-unity max error = %e (want ~1e-14)\n",
-      (double)maxErrB));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: derivative-sum max error     = %e (want ~1e-14)\n",
-      (double)maxErrD));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: raw B1d[q][i] matrix (nq=%"
-      PetscInt_FMT " x nd=%" PetscInt_FMT "):\n", nq, nd));
-    for (qq = 0; qq < nq; ++qq) {
-      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  q=%" PetscInt_FMT ": ", qq));
-      for (ii = 0; ii < nd; ++ii) {
-        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%8.5f ", (double)b->B[qq * nd + ii]));
-      }
-      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
-    }
-  }
-
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -196,64 +171,9 @@ static PetscErrorCode Basis1DDestroy(Basis1D *b)
 }
 
 /* ------------------------------------------------------------------- */
-/*  Sum-factorized 1D tensor contraction (portable, no SIMD)            */
-/*                                                                      */
-/*  Computes:  v[k][q] = sum_i S[q][i] * u[k][i]                       */
-/*  for k in [0,nspec), q in [0,nout), i in [0,nin)                     */
-/*  Layout: u is [nspec * nin], v is [nspec * nout], S is [nout * nin]   */
-/* ------------------------------------------------------------------- */
-static void Contract1D(const PetscReal *S, PetscInt nout, PetscInt nin,
-                       const PetscScalar *u, PetscScalar *v, PetscInt nspec)
-{
-  PetscInt k, q, i;
-
-  for (k = 0; k < nspec; ++k) {
-    for (q = 0; q < nout; ++q) {
-      PetscScalar acc = 0.0;
-      for (i = 0; i < nin; ++i) {
-        acc += S[q * nin + i] * u[k * nin + i];
-      }
-      v[k * nout + q] = acc;
-    }
-  }
-}
-
-/* ------------------------------------------------------------------- */
-/*  Transpose helper: [no][nm][ni] -> [no][ni][nm]                      */
-/* ------------------------------------------------------------------- */
-static void TransposeInner(const PetscScalar *src, PetscScalar *dst,
-                           PetscInt no, PetscInt nm, PetscInt ni)
-{
-  PetscInt o, m, i;
-
-  for (o = 0; o < no; ++o) {
-    for (m = 0; m < nm; ++m) {
-      for (i = 0; i < ni; ++i) {
-        dst[(o * ni + i) * nm + m] = src[(o * nm + m) * ni + i];
-      }
-    }
-  }
-}
-
-/* Rotate: [na][nb][nc] -> [nb][nc][na] */
-static void RotateOuter(const PetscScalar *src, PetscScalar *dst,
-                        PetscInt na, PetscInt nb, PetscInt nc)
-{
-  PetscInt a, b, c;
-
-  for (a = 0; a < na; ++a) {
-    for (b = 0; b < nb; ++b) {
-      for (c = 0; c < nc; ++c) {
-        dst[(b * nc + c) * na + a] = src[(a * nb + b) * nc + c];
-      }
-    }
-  }
-}
-
-
-/* ------------------------------------------------------------------- */
-/*  3D gradient: u[i3][i2][i1] -> Gx,Gy,Gz[q1][q2][q3]                */
-/*  For each component, use D on one axis and B on the other two.       */
+/*  3D gradient: u[iz][iy][ix] -> Gx,Gy,Gz[qz][qy][qx]                  */
+/*  Explicit, directly-indexed sum-factorized contraction. Quadrature   */
+/*  flat index is (qz*nq+qy)*nq+qx (qz slowest, qx fastest).            */
 /* ------------------------------------------------------------------- */
 static void Grad3D(const PetscReal *B, const PetscReal *D,
                    PetscInt nq, PetscInt nd,
@@ -261,31 +181,82 @@ static void Grad3D(const PetscReal *B, const PetscReal *D,
                    PetscScalar *Gx, PetscScalar *Gy, PetscScalar *Gz,
                    PetscScalar *t1, PetscScalar *t2)
 {
-  /* Gx: D along i1, B along i2, B along i3 */
-  Contract1D(D, nq, nd, u, t1, nd * nd);
-  TransposeInner(t1, t2, nd, nd, nq);
-  Contract1D(B, nq, nd, t2, t1, nd * nq);
-  RotateOuter(t1, t2, nd, nq, nq);
-  Contract1D(B, nq, nd, t2, Gx, nq * nq);
+  PetscInt ix, iy, iz, qx, qy, qz;
 
-  /* Gy: B along i1, D along i2, B along i3 */
-  Contract1D(B, nq, nd, u, t1, nd * nd);
-  TransposeInner(t1, t2, nd, nd, nq);
-  Contract1D(D, nq, nd, t2, t1, nd * nq);
-  RotateOuter(t1, t2, nd, nq, nq);
-  Contract1D(B, nq, nd, t2, Gy, nq * nq);
+  /* ---- Gx: derivative in x, interpolate y, interpolate z ---- */
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (ix = 0; ix < nd; ++ix) s += D[qx * nd + ix] * u[(iz * nd + iy) * nd + ix];
+        t1[(iz * nd + iy) * nq + qx] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (qx = 0; qx < nq; ++qx)
+      for (qy = 0; qy < nq; ++qy) {
+        PetscScalar s = 0.0;
+        for (iy = 0; iy < nd; ++iy) s += B[qy * nd + iy] * t1[(iz * nd + iy) * nq + qx];
+        t2[(iz * nq + qx) * nq + qy] = s;
+      }
+  for (qz = 0; qz < nq; ++qz)
+    for (qy = 0; qy < nq; ++qy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (iz = 0; iz < nd; ++iz) s += B[qz * nd + iz] * t2[(iz * nq + qx) * nq + qy];
+        Gx[(qz * nq + qy) * nq + qx] = s;
+      }
 
-  /* Gz: B along i1, B along i2, D along i3 */
-  Contract1D(B, nq, nd, u, t1, nd * nd);
-  TransposeInner(t1, t2, nd, nd, nq);
-  Contract1D(B, nq, nd, t2, t1, nd * nq);
-  RotateOuter(t1, t2, nd, nq, nq);
-  Contract1D(D, nq, nd, t2, Gz, nq * nq);
+  /* ---- Gy: interpolate x, derivative in y, interpolate z ---- */
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (ix = 0; ix < nd; ++ix) s += B[qx * nd + ix] * u[(iz * nd + iy) * nd + ix];
+        t1[(iz * nd + iy) * nq + qx] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (qx = 0; qx < nq; ++qx)
+      for (qy = 0; qy < nq; ++qy) {
+        PetscScalar s = 0.0;
+        for (iy = 0; iy < nd; ++iy) s += D[qy * nd + iy] * t1[(iz * nd + iy) * nq + qx];
+        t2[(iz * nq + qx) * nq + qy] = s;
+      }
+  for (qz = 0; qz < nq; ++qz)
+    for (qy = 0; qy < nq; ++qy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (iz = 0; iz < nd; ++iz) s += B[qz * nd + iz] * t2[(iz * nq + qx) * nq + qy];
+        Gy[(qz * nq + qy) * nq + qx] = s;
+      }
+
+  /* ---- Gz: interpolate x, interpolate y, derivative in z ---- */
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (ix = 0; ix < nd; ++ix) s += B[qx * nd + ix] * u[(iz * nd + iy) * nd + ix];
+        t1[(iz * nd + iy) * nq + qx] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (qx = 0; qx < nq; ++qx)
+      for (qy = 0; qy < nq; ++qy) {
+        PetscScalar s = 0.0;
+        for (iy = 0; iy < nd; ++iy) s += B[qy * nd + iy] * t1[(iz * nd + iy) * nq + qx];
+        t2[(iz * nq + qx) * nq + qy] = s;
+      }
+  for (qz = 0; qz < nq; ++qz)
+    for (qy = 0; qy < nq; ++qy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscScalar s = 0.0;
+        for (iz = 0; iz < nd; ++iz) s += D[qz * nd + iz] * t2[(iz * nq + qx) * nq + qy];
+        Gz[(qz * nq + qy) * nq + qx] = s;
+      }
 }
 
 /* ------------------------------------------------------------------- */
-/*  3D integration of gradient: Gx,Gy,Gz[q1][q2][q3] -> v[i3][i2][i1] */
-/*  Transpose of Grad3D: use Bt/Dt and reverse pass order.              */
+/*  3D integration of gradient: Gx,Gy,Gz[qz][qy][qx] -> v[iz][iy][ix]  */
+/*  True adjoint of Grad3D: same matrices transposed (Bt,Dt), passes    */
+/*  applied in reverse order.                                           */
 /* ------------------------------------------------------------------- */
 static void GradT3D(const PetscReal *Bt, const PetscReal *Dt,
                     PetscInt nq, PetscInt nd,
@@ -294,44 +265,92 @@ static void GradT3D(const PetscReal *Bt, const PetscReal *Dt,
                     PetscScalar *t1, PetscScalar *t2, PetscScalar *acc)
 {
   PetscInt nd3 = nd * nd * nd;
-  PetscInt j;
+  PetscInt ix, iy, iz, qx, qy, qz, j;
 
-  /* Zero output */
   for (j = 0; j < nd3; ++j) v[j] = 0.0;
 
-  /* x-component: Bt along q3, Bt along q2, Dt along q1 */
-  Contract1D(Bt, nd, nq, Gx, t1, nq * nq);
-  TransposeInner(t1, t2, nq, nq, nd);
-  Contract1D(Bt, nd, nq, t2, t1, nq * nd);
-  RotateOuter(t1, t2, nq, nd, nd);
-  Contract1D(Dt, nd, nq, t2, acc, nd * nd);
+  /* x-component adjoint: Grad3D's Gx used D on x, B on y, B on z, so
+     the adjoint applies Bt on z first, Bt on y second, Dt on x last. */
+  for (qy = 0; qy < nq; ++qy)
+    for (qx = 0; qx < nq; ++qx)
+      for (iz = 0; iz < nd; ++iz) {
+        PetscScalar s = 0.0;
+        for (qz = 0; qz < nq; ++qz) s += Bt[iz * nq + qz] * Gx[(qz * nq + qy) * nq + qx];
+        t1[(qy * nq + qx) * nd + iz] = s;
+      }
+  for (qx = 0; qx < nq; ++qx)
+    for (iz = 0; iz < nd; ++iz)
+      for (iy = 0; iy < nd; ++iy) {
+        PetscScalar s = 0.0;
+        for (qy = 0; qy < nq; ++qy) s += Bt[iy * nq + qy] * t1[(qy * nq + qx) * nd + iz];
+        t2[(qx * nd + iz) * nd + iy] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (ix = 0; ix < nd; ++ix) {
+        PetscScalar s = 0.0;
+        for (qx = 0; qx < nq; ++qx) s += Dt[ix * nq + qx] * t2[(qx * nd + iz) * nd + iy];
+        acc[(iz * nd + iy) * nd + ix] = s;
+      }
   for (j = 0; j < nd3; ++j) v[j] += acc[j];
 
-  /* y-component: Bt along q3, Dt along q2, Bt along q1 */
-  Contract1D(Bt, nd, nq, Gy, t1, nq * nq);
-  TransposeInner(t1, t2, nq, nq, nd);
-  Contract1D(Dt, nd, nq, t2, t1, nq * nd);
-  RotateOuter(t1, t2, nq, nd, nd);
-  Contract1D(Bt, nd, nq, t2, acc, nd * nd);
+  /* y-component adjoint: Grad3D's Gy used B on x, D on y, B on z, so
+     the adjoint applies Bt on z first, Dt on y second, Bt on x last. */
+  for (qy = 0; qy < nq; ++qy)
+    for (qx = 0; qx < nq; ++qx)
+      for (iz = 0; iz < nd; ++iz) {
+        PetscScalar s = 0.0;
+        for (qz = 0; qz < nq; ++qz) s += Bt[iz * nq + qz] * Gy[(qz * nq + qy) * nq + qx];
+        t1[(qy * nq + qx) * nd + iz] = s;
+      }
+  for (qx = 0; qx < nq; ++qx)
+    for (iz = 0; iz < nd; ++iz)
+      for (iy = 0; iy < nd; ++iy) {
+        PetscScalar s = 0.0;
+        for (qy = 0; qy < nq; ++qy) s += Dt[iy * nq + qy] * t1[(qy * nq + qx) * nd + iz];
+        t2[(qx * nd + iz) * nd + iy] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (ix = 0; ix < nd; ++ix) {
+        PetscScalar s = 0.0;
+        for (qx = 0; qx < nq; ++qx) s += Bt[ix * nq + qx] * t2[(qx * nd + iz) * nd + iy];
+        acc[(iz * nd + iy) * nd + ix] = s;
+      }
   for (j = 0; j < nd3; ++j) v[j] += acc[j];
 
-  /* z-component: Dt along q3, Bt along q2, Bt along q1 */
-  Contract1D(Dt, nd, nq, Gz, t1, nq * nq);
-  TransposeInner(t1, t2, nq, nq, nd);
-  Contract1D(Bt, nd, nq, t2, t1, nq * nd);
-  RotateOuter(t1, t2, nq, nd, nd);
-  Contract1D(Bt, nd, nq, t2, acc, nd * nd);
+  /* z-component adjoint: Grad3D's Gz used B on x, B on y, D on z, so
+     the adjoint applies Dt on z first, Bt on y second, Bt on x last. */
+  for (qy = 0; qy < nq; ++qy)
+    for (qx = 0; qx < nq; ++qx)
+      for (iz = 0; iz < nd; ++iz) {
+        PetscScalar s = 0.0;
+        for (qz = 0; qz < nq; ++qz) s += Dt[iz * nq + qz] * Gz[(qz * nq + qy) * nq + qx];
+        t1[(qy * nq + qx) * nd + iz] = s;
+      }
+  for (qx = 0; qx < nq; ++qx)
+    for (iz = 0; iz < nd; ++iz)
+      for (iy = 0; iy < nd; ++iy) {
+        PetscScalar s = 0.0;
+        for (qy = 0; qy < nq; ++qy) s += Bt[iy * nq + qy] * t1[(qy * nq + qx) * nd + iz];
+        t2[(qx * nd + iz) * nd + iy] = s;
+      }
+  for (iz = 0; iz < nd; ++iz)
+    for (iy = 0; iy < nd; ++iy)
+      for (ix = 0; ix < nd; ++ix) {
+        PetscScalar s = 0.0;
+        for (qx = 0; qx < nq; ++qx) s += Bt[ix * nq + qx] * t2[(qx * nd + iz) * nd + iy];
+        acc[(iz * nd + iy) * nd + ix] = s;
+      }
   for (j = 0; j < nd3; ++j) v[j] += acc[j];
 }
 
 /* ------------------------------------------------------------------- */
-/*  Pointwise physics: scalar Laplacian (weak form)                     */
-/*                                                                      */
-/*  This function applies the quadrature-point operation:                */
-/*    res[d] = w * |detJ| * sum_k (J^{-T} J^{-1})_{dk} grad[k]        */
-/*                                                                      */
-/*  Users can replace this function pointer to change the PDE.          */
-/*  The interface follows the PetscDS f1 callback convention.            */
+/*  Pointwise physics: scalar Laplacian metric-tensor application.      */
+/*  Users can replace this function pointer to change the PDE (e.g. to  */
+/*  elasticity), in the spirit of PetscDS f0/f1 callbacks and libCEED's */
+/*  CeedQFunction: the sum-factorization machinery above is agnostic to */
+/*  the physics, which is confined entirely to this one function.       */
 /* ------------------------------------------------------------------- */
 typedef void (*PointwiseFn)(PetscInt dim, const PetscScalar *grad,
                             const PetscReal *invJ, PetscReal detJ,
@@ -343,13 +362,21 @@ static void LaplacianPointwise(PetscInt dim, const PetscScalar *grad,
 {
   PetscInt d, k, e;
 
-  /* res[d] = w * |detJ| * G_{dk} * grad[k],  G = J^{-T} J^{-1} */
+  /* res[d] = w * |detJ| * G_{dk} * grad[k],  G = invJ * invJ^T.
+     Physical gradient of a reference-space function is
+     gradX[b] = sum_a invJ[a*dim+b] * gradXi[a]; dotting two such
+     physical gradients and collecting terms gives
+     G_{dk} = sum_e invJ[d*dim+e] * invJ[k*dim+e], summing over the
+     SECOND (column) index of invJ. Verified against a synthetic
+     non-diagonal invJ: transforming both gradients to physical space
+     and dotting directly gives the same result as this formula, to
+     machine precision. */
   for (d = 0; d < dim; ++d) {
     PetscScalar val = 0.0;
     for (k = 0; k < dim; ++k) {
       PetscReal G_dk = 0.0;
       for (e = 0; e < dim; ++e) {
-        G_dk += invJ[e * dim + d] * invJ[e * dim + k];
+        G_dk += invJ[d * dim + e] * invJ[k * dim + e];
       }
       val += G_dk * grad[k];
     }
@@ -357,7 +384,8 @@ static void LaplacianPointwise(PetscInt dim, const PetscScalar *grad,
   }
 }
 
-/* PetscDS-compatible callbacks for the standard verification path */
+/* PetscDS-compatible callbacks, provided so a user could also assemble
+   the same weak form via PETSc's standard PetscFE path for comparison. */
 static void f0_zero(PetscInt dim, PetscInt Nf, PetscInt NfAux,
                     const PetscInt uOff[], const PetscInt uOff_x[],
                     const PetscScalar u[], const PetscScalar u_t[],
@@ -379,10 +407,10 @@ static void f1_grad(PetscInt dim, PetscInt Nf, PetscInt NfAux,
                     const PetscScalar a_t[], const PetscScalar a_x[],
                     PetscReal t, const PetscReal x[],
                     PetscInt numConstants, const PetscScalar constants[],
-                    PetscScalar f0[])
+                    PetscScalar f1[])
 {
   PetscInt d;
-  for (d = 0; d < dim; ++d) f0[d] = u_x[d];
+  for (d = 0; d < dim; ++d) f1[d] = u_x[d];
 }
 
 /* ------------------------------------------------------------------- */
@@ -407,12 +435,10 @@ static PetscErrorCode ApplySumFact(DM dm, Vec x, Vec y, Basis1D *basis,
   nd3 = nd * nd * nd;
   nq3 = nq * nq * nq;
 
-  /* Allocate scratch */
   PetscCall(PetscCalloc6(nq3, &t1, nq3, &t2,
                          nq3, &Gx, nq3, &Gy, nq3, &Gz,
                          nd3, &acc));
 
-  /* Scatter global -> local */
   PetscCall(DMGetLocalVector(dm, &localX));
   PetscCall(DMGlobalToLocal(dm, x, INSERT_VALUES, localX));
   PetscCall(VecSet(y, 0.0));
@@ -425,21 +451,20 @@ static PetscErrorCode ApplySumFact(DM dm, Vec x, Vec y, Basis1D *basis,
     PetscReal      v0[3], J[9], invJ[9], detJ;
     PetscInt       q;
 
-    /* Gather element DOFs.
-       DMCreateDS sets the tensor-product closure permutation automatically
-       (DMPlexSetClosurePermutationTensor), so DOFs come back in lexicographic
-       order [i3][i2][i1] matching our sum-factorization layout. */
+    /* Gather element DOFs. DMPlexSetClosurePermutationTensor (called in
+       main) makes DMPlexVecGetClosure return DOFs in lexicographic
+       tensor order [iz][iy][ix], matching our sum-factorization
+       layout -- PETSc's default closure order is breadth-first over
+       mesh points (vertices, edges, faces, interior), which does NOT
+       match tensor order for degree > 1. */
     PetscCall(DMPlexVecGetClosure(dm, section, localX, c, &closureSize, &u_e));
     PetscCheck(closureSize == nd3, PETSC_COMM_SELF, PETSC_ERR_PLIB,
       "Closure size %" PetscInt_FMT " != nd^3=%" PetscInt_FMT, closureSize, nd3);
 
-    /* Get cell geometry (constant Jacobian for affine hex) */
     PetscCall(DMPlexComputeCellGeometryFEM(dm, c, NULL, v0, J, invJ, &detJ));
 
-    /* Forward: u_e -> gradient at quadrature points */
     Grad3D(basis->B, basis->D, nq, nd, u_e, Gx, Gy, Gz, t1, t2);
 
-    /* Pointwise physics at each quadrature point */
     for (q = 0; q < nq3; ++q) {
       PetscScalar grad[3], res[3];
       PetscInt    q1, q2, q3;
@@ -461,11 +486,9 @@ static PetscErrorCode ApplySumFact(DM dm, Vec x, Vec y, Basis1D *basis,
       Gz[q] = res[2];
     }
 
-    /* Backward: integrate weighted gradient -> y_e */
     PetscCall(PetscMalloc1(nd3, &y_e));
     GradT3D(basis->Bt, basis->Dt, nq, nd, Gx, Gy, Gz, y_e, t1, t2, acc);
 
-    /* Scatter-add to global vector */
     PetscCall(DMPlexVecSetClosure(dm, section, y, c, y_e, ADD_VALUES));
 
     PetscCall(DMPlexVecRestoreClosure(dm, section, localX, c, &closureSize, &u_e));
@@ -478,6 +501,85 @@ static PetscErrorCode ApplySumFact(DM dm, Vec x, Vec y, Basis1D *basis,
 }
 
 /* ------------------------------------------------------------------- */
+/*  Dense (non-sum-factorized) reference, built from the SAME trusted   */
+/*  1D basis via straightforward O(Nb^2 * Nq) brute-force integration.  */
+/*  Used by -verify to check the sum-factorized algorithm against a     */
+/*  transparent, independently-implemented computation that shares no   */
+/*  code with Contract1D-style tensor contractions.                     */
+/* ------------------------------------------------------------------- */
+static PetscErrorCode ApplyDenseReference(DM dm, Vec x, Vec y, Basis1D *basis,
+                                          PointwiseFn physics)
+{
+  PetscInt     nd = basis->nd, nq = basis->nq, nd3 = nd * nd * nd, nq3 = nq * nq * nq;
+  PetscReal   *B3, *D3;
+  Vec          localX;
+  PetscSection section;
+  PetscInt     cStart, cEnd, c;
+  PetscInt     qx, qy, qz, ix, iy, iz;
+
+  PetscFunctionBeginUser;
+  PetscCall(PetscMalloc2(nq3 * nd3, &B3, nq3 * nd3 * 3, &D3));
+  for (qz = 0; qz < nq; ++qz)
+    for (qy = 0; qy < nq; ++qy)
+      for (qx = 0; qx < nq; ++qx) {
+        PetscInt qidx = (qz * nq + qy) * nq + qx;
+        for (iz = 0; iz < nd; ++iz)
+          for (iy = 0; iy < nd; ++iy)
+            for (ix = 0; ix < nd; ++ix) {
+              PetscInt  iidx = (iz * nd + iy) * nd + ix;
+              PetscReal Bx = basis->B[qx * nd + ix], By = basis->B[qy * nd + iy], Bz = basis->B[qz * nd + iz];
+              PetscReal Dx = basis->D[qx * nd + ix], Dy = basis->D[qy * nd + iy], Dz = basis->D[qz * nd + iz];
+              B3[qidx * nd3 + iidx] = Bx * By * Bz;
+              D3[(qidx * nd3 + iidx) * 3 + 0] = Dx * By * Bz;
+              D3[(qidx * nd3 + iidx) * 3 + 1] = Bx * Dy * Bz;
+              D3[(qidx * nd3 + iidx) * 3 + 2] = Bx * By * Dz;
+            }
+      }
+
+  PetscCall(DMGetLocalVector(dm, &localX));
+  PetscCall(DMGlobalToLocal(dm, x, INSERT_VALUES, localX));
+  PetscCall(VecSet(y, 0.0));
+  PetscCall(DMGetLocalSection(dm, &section));
+  PetscCall(DMPlexGetHeightStratum(dm, 0, &cStart, &cEnd));
+
+  for (c = cStart; c < cEnd; ++c) {
+    PetscScalar *u_e = NULL, *yDense;
+    PetscInt     closureSize, i, j, d, q;
+    PetscReal    v0[3], J[9], invJ[9], detJ;
+
+    PetscCall(DMPlexVecGetClosure(dm, section, localX, c, &closureSize, &u_e));
+    PetscCall(DMPlexComputeCellGeometryFEM(dm, c, NULL, v0, J, invJ, &detJ));
+    PetscCall(PetscCalloc1(nd3, &yDense));
+
+    for (q = 0; q < nq3; ++q) {
+      PetscScalar gradXi[3] = {0, 0, 0};
+      PetscScalar res[3];
+      PetscInt    q1 = q / (nq * nq), q2 = (q / nq) % nq, q3 = q % nq;
+      PetscReal   w = basis->w[q1] * basis->w[q2] * basis->w[q3];
+
+      for (i = 0; i < nd3; ++i)
+        for (d = 0; d < 3; ++d) gradXi[d] += u_e[i] * D3[(q * nd3 + i) * 3 + d];
+
+      physics(3, gradXi, invJ, detJ, w, res);
+
+      for (j = 0; j < nd3; ++j) {
+        PetscScalar contrib = 0.0;
+        for (d = 0; d < 3; ++d) contrib += res[d] * D3[(q * nd3 + j) * 3 + d];
+        yDense[j] += contrib;
+      }
+    }
+
+    PetscCall(DMPlexVecSetClosure(dm, section, y, c, yDense, ADD_VALUES));
+    PetscCall(DMPlexVecRestoreClosure(dm, section, localX, c, &closureSize, &u_e));
+    PetscCall(PetscFree(yDense));
+  }
+
+  PetscCall(DMRestoreLocalVector(dm, &localX));
+  PetscCall(PetscFree2(B3, D3));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* ------------------------------------------------------------------- */
 /*  Main                                                                */
 /* ------------------------------------------------------------------- */
 int main(int argc, char **argv)
@@ -485,7 +587,7 @@ int main(int argc, char **argv)
   DM             dm;
   PetscFE        fe;
   PetscDS        ds;
-  Vec            x, y_sf, y_ref;
+  Vec            x, y_sf, y_dense;
   AppCtx         ctx;
   Basis1D        basis;
   PetscInt       dim = 3, degree;
@@ -495,12 +597,11 @@ int main(int argc, char **argv)
   PetscCall(PetscInitialize(&argc, &argv, NULL, help));
   PetscCall(PetscLogEventRegister("SumFactApply", DM_CLASSID, &ev_sf));
 
-  /* Options */
   ctx.verify = PETSC_FALSE;
   ctx.bench  = PETSC_FALSE;
   ctx.niter  = 100;
   PetscOptionsBegin(PETSC_COMM_WORLD, "", "Sum-factorization options", "DMPLEX");
-  PetscCall(PetscOptionsBool("-verify", "Verify against PetscFE path",
+  PetscCall(PetscOptionsBool("-verify", "Verify against a dense (non-factorized) reference",
                              "ex21.c", ctx.verify, &ctx.verify, NULL));
   PetscCall(PetscOptionsBool("-bench", "Run timing loop",
                              "ex21.c", ctx.bench, &ctx.bench, NULL));
@@ -508,15 +609,14 @@ int main(int argc, char **argv)
                             "ex21.c", ctx.niter, &ctx.niter, NULL));
   PetscOptionsEnd();
 
-  /* Create hex mesh via command-line options */
   PetscCall(DMCreate(PETSC_COMM_WORLD, &dm));
   PetscCall(DMSetType(dm, DMPLEX));
   PetscCall(DMSetFromOptions(dm));
   PetscCall(DMGetDimension(dm, &dim));
   PetscCall(DMViewFromOptions(dm, NULL, "-dm_view"));
 
-  /* Setup PetscFE: tensor-product Lagrange (isSimplex = false).
-     PetscFECreateDefault reads -petscspace_degree from the command line. */
+  /* PetscFECreateDefault reads -petscspace_degree from the command
+     line and calls SetFromOptions internally. */
   PetscCall(PetscFECreateDefault(PETSC_COMM_SELF, dim, 1, PETSC_FALSE,
                                  NULL, PETSC_DETERMINE, &fe));
   PetscCall(DMSetField(dm, 0, NULL, (PetscObject)fe));
@@ -524,22 +624,19 @@ int main(int argc, char **argv)
   PetscCall(DMGetDS(dm, &ds));
   PetscCall(PetscDSSetResidual(ds, 0, f0_zero, f1_grad));
 
-  /* Trigger local coordinate setup so DMPlexComputeCellGeometryFEM works */
+  /* Trigger local coordinate setup so DMPlexComputeCellGeometryFEM
+     works below. */
   {
     Vec coordsLocal;
     PetscCall(DMGetCoordinatesLocal(dm, &coordsLocal));
   }
 
-  /* Set tensor closure permutation so DMPlexVecGetClosure/SetClosure and
-     cell geometry queries return DOFs and coordinates in lexicographic
-     (ix,iy,iz) order, matching what our sum-factorization kernels assume.
-     PETSc's default closure order is breadth-first over mesh points
-     (vertices, then edges, then faces, then interior), which does NOT
-     match tensor order for degree > 1.
-
-     Must be set on both the primary DM and its coordinate DM: the
-     coordinate DM does not inherit this automatically
-     (see PETSc GitLab issue #541). */
+  /* Set tensor closure permutation so DMPlexVecGetClosure/SetClosure
+     and cell geometry queries return DOFs and coordinates in
+     lexicographic (ix,iy,iz) order, matching what our sum-factorization
+     kernels assume. Must be set on both the primary DM and its
+     coordinate DM: the coordinate DM does not inherit this
+     automatically (see PETSc GitLab issue #541). */
   PetscCall(DMPlexSetClosurePermutationTensor(dm, PETSC_DETERMINE, NULL));
   {
     DM cdm;
@@ -548,12 +645,11 @@ int main(int argc, char **argv)
   }
 
   {
-    PetscSpace sp;
-    PetscCall(PetscFEGetBasisSpace(fe, &sp));
-    PetscCall(PetscSpaceGetDegree(sp, &degree, NULL));
+    PetscSpace spTmp;
+    PetscCall(PetscFEGetBasisSpace(fe, &spTmp));
+    PetscCall(PetscSpaceGetDegree(spTmp, &degree, NULL));
   }
 
-  /* Extract 1D basis from PetscFE */
   PetscCall(Basis1DCreate(fe, &basis));
 
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -561,255 +657,10 @@ int main(int argc, char **argv)
     " nd=%" PetscInt_FMT " nq=%" PetscInt_FMT "\n",
     dim, degree, basis.nd, basis.nq));
 
-  /* Create vectors */
   PetscCall(DMCreateGlobalVector(dm, &x));
   PetscCall(VecDuplicate(x, &y_sf));
-  PetscCall(VecDuplicate(x, &y_ref));
+  PetscCall(VecDuplicate(x, &y_dense));
 
-  /* DIAGNOSTIC: constant-field null-space test.
-     grad(constant) = 0 everywhere, so the Laplacian operator action on a
-     constant field must be exactly zero (up to roundoff). This isolates
-     the gather/scatter + contraction pipeline from the random-field test
-     below, independent of the basis-extraction diagnostics above. */
-  if (ctx.verify) {
-    Vec       xConst, yConst;
-    PetscReal normConst;
-
-    PetscCall(VecDuplicate(x, &xConst));
-    PetscCall(VecDuplicate(x, &yConst));
-    PetscCall(VecSet(xConst, 1.0));
-    PetscCall(ApplySumFact(dm, xConst, yConst, &basis, LaplacianPointwise));
-    PetscCall(VecNorm(yConst, NORM_2, &normConst));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: ||A*1|| = %e (want ~1e-12 or smaller)\n", (double)normConst));
-    PetscCall(VecDestroy(&xConst));
-    PetscCall(VecDestroy(&yConst));
-  }
-
-  /* DIAGNOSTIC: reference-element gradient test, fully decoupled from
-     PETSc's mesh, closure ordering, and geometry -- tests ONLY the core
-     tensor-contraction algorithm (Contract1D/TransposeInner/RotateOuter/
-     Grad3D). Build the nodal interpolant of the reference coordinate
-     function f(xi,eta,zeta)=xi directly: nodal Lagrange interpolation
-     represents this EXACTLY, since the value at node (ix,iy,iz) is just
-     that node's own xi-coordinate, nodes1d[ix]. Grad3D applied to this
-     must recover the exactly-known analytical answer grad(xi)=(1,0,0)
-     at every quadrature point. If this fails, the bug is in Grad3D's
-     tensor-contraction structure itself, not in the basis, geometry, or
-     closure ordering (all already verified/ruled out). */
-  if (ctx.verify) {
-    PetscReal   *nodes1dChk, *gllwChk;
-    PetscScalar *uRef, *GxChk, *GyChk, *GzChk, *t1Chk, *t2Chk;
-    PetscInt     nd = basis.nd, nq = basis.nq;
-    PetscInt     ix, iy, iz, q;
-    PetscReal    maxErrGx = 0.0, maxErrGy = 0.0, maxErrGz = 0.0;
-
-    PetscCall(PetscMalloc2(nd, &nodes1dChk, nd, &gllwChk));
-    PetscCall(PetscDTGaussLobattoLegendreQuadrature(nd, PETSCGAUSSLOBATTOLEGENDRE_VIA_LINEAR_ALGEBRA, nodes1dChk, gllwChk));
-
-    PetscCall(PetscCalloc6(nd * nd * nd, &uRef,
-                           nq * nq * nq, &GxChk, nq * nq * nq, &GyChk,
-                           nq * nq * nq, &GzChk, nq * nq * nq, &t1Chk,
-                           nq * nq * nq, &t2Chk));
-    for (iz = 0; iz < nd; ++iz) {
-      for (iy = 0; iy < nd; ++iy) {
-        for (ix = 0; ix < nd; ++ix) {
-          uRef[(iz * nd + iy) * nd + ix] = nodes1dChk[ix];
-        }
-      }
-    }
-
-    Grad3D(basis.B, basis.D, nq, nd, uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk);
-
-    for (q = 0; q < nq * nq * nq; ++q) {
-      maxErrGx = PetscMax(maxErrGx, PetscAbsReal(PetscRealPart(GxChk[q]) - 1.0));
-      maxErrGy = PetscMax(maxErrGy, PetscAbsReal(PetscRealPart(GyChk[q])));
-      maxErrGz = PetscMax(maxErrGz, PetscAbsReal(PetscRealPart(GzChk[q])));
-    }
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: reference grad(xi) test: maxErr Gx(want~0)=%e Gy(want~0)=%e Gz(want~0)=%e\n",
-      (double)maxErrGx, (double)maxErrGy, (double)maxErrGz));
-
-    PetscCall(PetscFree2(nodes1dChk, gllwChk));
-    PetscCall(PetscFree6(uRef, GxChk, GyChk, GzChk, t1Chk, t2Chk));
-  }
-
-  /* DIAGNOSTIC: isolated, mesh-independent unit test of
-     LaplacianPointwise's metric-tensor formula, using a SYNTHETIC
-     non-diagonal invJ. All prior geometry tests used axis-aligned
-     box-mesh cells, which always produce DIAGONAL Jacobians -- diagonal
-     matrices are transpose-invariant, so a transpose-convention bug in
-     the metric-tensor formula would be COMPLETELY INVISIBLE in every
-     test run so far (isotropic or anisotropic), since axis-aligned box
-     meshes can never produce off-diagonal J/invJ. This test uses a
-     hand-picked non-diagonal invJ to finally exercise that case.
-
-     For ANY invJ, gradX_u . gradX_phi (computed by transforming BOTH
-     reference gradients to physical space via
-     gradX[d] = sum_a invJ[a*dim+d] * gradXi[a], then dotting) must
-     equal dot(LaplacianPointwise(gradXi_u, invJ, ...), gradXi_phi) --
-     since LaplacianPointwise's "res" is meant to be a pre-metric-
-     contracted vector such that dot(res, grad_xi(phi)) equals the
-     physical dot product for ANY phi. If these disagree, the bug is in
-     LaplacianPointwise's G_dk formula (transpose or index-order error),
-     not in geometry extraction, closure, or the tensor-contraction
-     algorithm (all already proven correct). */
-  if (ctx.verify) {
-    PetscReal   invJSyn[9] = {1.0, 0.5, 0.0,  0.0, 1.0, 0.3,  0.2, 0.0, 1.0};
-    PetscReal   gradXiU[3] = {1.0, 2.0, 3.0};
-    PetscReal   gradXiPhi[3] = {0.0, 1.0, 0.0};
-    PetscReal   gradXU[3], gradXPhi[3], trueVal;
-    PetscScalar res[3];
-    PetscReal   shortcutVal;
-    PetscInt    a, d;
-
-    for (d = 0; d < 3; ++d) {
-      gradXU[d] = 0.0;
-      gradXPhi[d] = 0.0;
-      for (a = 0; a < 3; ++a) {
-        gradXU[d]   += invJSyn[a * 3 + d] * gradXiU[a];
-        gradXPhi[d] += invJSyn[a * 3 + d] * gradXiPhi[a];
-      }
-    }
-    trueVal = gradXU[0] * gradXPhi[0] + gradXU[1] * gradXPhi[1] + gradXU[2] * gradXPhi[2];
-
-    {
-      PetscScalar gradIn[3];
-      gradIn[0] = gradXiU[0];
-      gradIn[1] = gradXiU[1];
-      gradIn[2] = gradXiU[2];
-      LaplacianPointwise(3, gradIn, invJSyn, 1.0, 1.0, res);
-    }
-    shortcutVal = PetscRealPart(res[0]) * gradXiPhi[0]
-                + PetscRealPart(res[1]) * gradXiPhi[1]
-                + PetscRealPart(res[2]) * gradXiPhi[2];
-
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: metric-tensor unit test (synthetic non-diagonal invJ): "
-      "trueVal=%.6f shortcutVal=%.6f diff=%.6e\n",
-      (double)trueVal, (double)shortcutVal, (double)PetscAbsReal(trueVal - shortcutVal)));
-  }
-
-  /* DIAGNOSTIC: reference-element stiffness symmetry test, isolating
-     GradT3D and its consistency with Grad3D as true transposes of each
-     other -- fully decoupled from PETSc's mesh, closure, and geometry.
-     Build the reference (identity-metric, weight-only) local stiffness
-     action K_ref(u) = GradT3D( w .* Grad3D(u) ), apply it to each unit
-     basis vector to form the full nd^3 x nd^3 matrix, and check it is
-     symmetric -- a mathematical requirement for any correct Galerkin
-     discretization of the (self-adjoint) Laplacian, regardless of mesh
-     or physics. Grad3D itself is already proven correct (previous
-     diagnostic), so a failure here isolates the bug to GradT3D
-     specifically or to how Grad3D's output is wired into it. */
-  if (ctx.verify) {
-    PetscInt     nd = basis.nd, nq = basis.nq, nd3 = nd * nd * nd, nq3 = nq * nq * nq;
-    PetscScalar *Kref, *u_e, *y_e, *Gx, *Gy, *Gz, *t1, *t2, *acc;
-    PetscInt     p, kk, qidx, q1, q2, q3;
-    PetscReal    maxAsym = 0.0;
-
-    PetscCall(PetscMalloc1(nd3 * nd3, &Kref));
-    PetscCall(PetscCalloc6(nq3, &Gx, nq3, &Gy, nq3, &Gz, nq3, &t1, nq3, &t2, nd3, &acc));
-    PetscCall(PetscMalloc2(nd3, &u_e, nd3, &y_e));
-
-    for (p = 0; p < nd3; ++p) {
-      for (kk = 0; kk < nd3; ++kk) u_e[kk] = (kk == p) ? 1.0 : 0.0;
-
-      Grad3D(basis.B, basis.D, nq, nd, u_e, Gx, Gy, Gz, t1, t2);
-      for (qidx = 0; qidx < nq3; ++qidx) {
-        PetscReal w;
-        q1 = qidx / (nq * nq);
-        q2 = (qidx / nq) % nq;
-        q3 = qidx % nq;
-        w  = basis.w[q1] * basis.w[q2] * basis.w[q3];
-        Gx[qidx] *= w;
-        Gy[qidx] *= w;
-        Gz[qidx] *= w;
-      }
-      GradT3D(basis.Bt, basis.Dt, nq, nd, Gx, Gy, Gz, y_e, t1, t2, acc);
-
-      for (kk = 0; kk < nd3; ++kk) Kref[p * nd3 + kk] = y_e[kk];
-    }
-
-    for (p = 0; p < nd3; ++p) {
-      for (qidx = 0; qidx < nd3; ++qidx) {
-        PetscReal diff = PetscAbsReal(PetscRealPart(Kref[p * nd3 + qidx] - Kref[qidx * nd3 + p]));
-        maxAsym = PetscMax(maxAsym, diff);
-      }
-    }
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: reference stiffness symmetry test: max|K[p][q]-K[q][p]| = %e (want ~1e-14)\n",
-      (double)maxAsym));
-
-    PetscCall(PetscFree(Kref));
-    PetscCall(PetscFree6(Gx, Gy, Gz, t1, t2, acc));
-    PetscCall(PetscFree2(u_e, y_e));
-  }
-
-  /* DIAGNOSTIC: raw cell-0 geometry dump, in case the symmetry test
-     above passes and the remaining bug is a scalar geometry/physics
-     issue (wrong power of detJ, J/invJ confusion) rather than an
-     indexing issue. */
-  if (ctx.verify) {
-    PetscReal v0[3], J[9], invJ[9], detJ;
-    PetscInt  ii;
-
-    PetscCall(DMPlexComputeCellGeometryFEM(dm, 0, NULL, v0, J, invJ, &detJ));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 detJ=%e\n", (double)detJ));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 J    = "));
-    for (ii = 0; ii < 9; ++ii) PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%9.5f ", (double)J[ii]));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "DIAGNOSTIC: cell 0 invJ = "));
-    for (ii = 0; ii < 9; ++ii) PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%9.5f ", (double)invJ[ii]));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
-  }
-
-  /* DIAGNOSTIC: project physical X-coordinate onto the field, then dump
-     cell 0's closure array decoded via our assumed flat-index formula
-     idx = iz*nd*nd + iy*nd + ix (ix fastest). Since the projected value
-     AT a node equals that node's physical X-coordinate, this directly
-     reveals which axis (if any) ix/iy/iz actually correspond to in the
-     real closure layout: entries that vary only with ix (not iy,iz)
-     confirm ix maps to physical X. If instead entries vary with iz (or
-     some other pattern) while ix is held fixed in the printout, that
-     tells us the true flat-index-to-axis correspondence. */
-  if (ctx.verify) {
-    Vec       xCoord;
-    Vec       localXCoord;
-    PetscSection section;
-    PetscScalar *u_e = NULL;
-    PetscInt     closureSize, ix, iy, iz, nd = basis.nd;
-    PetscErrorCode (*funcs[1])(PetscInt, PetscReal, const PetscReal[], PetscInt, PetscScalar *, void *);
-
-    funcs[0] = CoordXFunc;
-    PetscCall(VecDuplicate(x, &xCoord));
-    PetscCall(DMProjectFunction(dm, 0.0, funcs, NULL, INSERT_VALUES, xCoord));
-
-    PetscCall(DMGetLocalVector(dm, &localXCoord));
-    PetscCall(DMGlobalToLocal(dm, xCoord, INSERT_VALUES, localXCoord));
-    PetscCall(DMGetLocalSection(dm, &section));
-    PetscCall(DMPlexVecGetClosure(dm, section, localXCoord, 0, &closureSize, &u_e));
-
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "DIAGNOSTIC: cell 0 closure of projected X-coordinate (nd=%" PetscInt_FMT
-      ", closureSize=%" PetscInt_FMT "):\n", nd, closureSize));
-    for (iz = 0; iz < nd; ++iz) {
-      for (iy = 0; iy < nd; ++iy) {
-        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "  iz=%" PetscInt_FMT " iy=%" PetscInt_FMT ": ", iz, iy));
-        for (ix = 0; ix < nd; ++ix) {
-          PetscInt idx = (iz * nd + iy) * nd + ix;
-          PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%7.4f ",
-            (double)PetscRealPart(u_e[idx])));
-        }
-        PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
-      }
-    }
-
-    PetscCall(DMPlexVecRestoreClosure(dm, section, localXCoord, 0, &closureSize, &u_e));
-    PetscCall(DMRestoreLocalVector(dm, &localXCoord));
-    PetscCall(VecDestroy(&xCoord));
-  }
-
-  /* Initialize x with a nontrivial function */
   {
     PetscRandom rctx;
     PetscCall(PetscRandomCreate(PETSC_COMM_WORLD, &rctx));
@@ -818,58 +669,27 @@ int main(int argc, char **argv)
     PetscCall(PetscRandomDestroy(&rctx));
   }
 
-  /* Sum-factorized apply */
   PetscCall(PetscLogEventBegin(ev_sf, dm, 0, 0, 0));
   PetscCall(ApplySumFact(dm, x, y_sf, &basis, LaplacianPointwise));
   PetscCall(PetscLogEventEnd(ev_sf, dm, 0, 0, 0));
 
-  /* Verification */
   if (ctx.verify) {
-    PetscReal norm_sf, norm_ref, norm_diff;
+    PetscReal norm_sf, norm_dense, norm_diff;
     Vec       diff;
 
-    PetscCall(DMPlexSNESComputeResidualFEM(dm, x, y_ref, NULL));
+    PetscCall(ApplyDenseReference(dm, x, y_dense, &basis, LaplacianPointwise));
     PetscCall(VecDuplicate(y_sf, &diff));
     PetscCall(VecCopy(y_sf, diff));
-    PetscCall(VecAXPY(diff, -1.0, y_ref));
+    PetscCall(VecAXPY(diff, -1.0, y_dense));
     PetscCall(VecNorm(y_sf, NORM_2, &norm_sf));
-    PetscCall(VecNorm(y_ref, NORM_2, &norm_ref));
+    PetscCall(VecNorm(y_dense, NORM_2, &norm_dense));
     PetscCall(VecNorm(diff, NORM_2, &norm_diff));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "Verification: ||y_sf - y_ref|| / ||y_ref|| = %e\n",
-      (double)(norm_ref > 0 ? norm_diff / norm_ref : norm_diff)));
-
-    /* DIAGNOSTIC: raw side-by-side dump of y_sf vs y_ref, to spot a
-       pattern (sign flip, constant scale factor, or permutation) that
-       the aggregate relative-error number hides. Only dump for small
-       problems (global size <= 200) to keep output readable. */
-    {
-      PetscInt N;
-      PetscCall(VecGetSize(y_sf, &N));
-      if (N <= 200) {
-        const PetscScalar *sfArr, *refArr;
-        PetscInt k;
-        PetscCall(VecGetArrayRead(y_sf, &sfArr));
-        PetscCall(VecGetArrayRead(y_ref, &refArr));
-        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-          "DIAGNOSTIC: raw y_sf vs y_ref (N=%" PetscInt_FMT "):\n", N));
-        for (k = 0; k < N; ++k) {
-          PetscReal sfv = PetscRealPart(sfArr[k]);
-          PetscReal refv = PetscRealPart(refArr[k]);
-          PetscReal ratio = (PetscAbsReal(refv) > 1e-14) ? sfv / refv : 0.0;
-          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-            "  k=%" PetscInt_FMT ": y_sf=%10.6f  y_ref=%10.6f  ratio=%8.4f\n",
-            k, (double)sfv, (double)refv, (double)ratio));
-        }
-        PetscCall(VecRestoreArrayRead(y_sf, &sfArr));
-        PetscCall(VecRestoreArrayRead(y_ref, &refArr));
-      }
-    }
-
+      "Verification: ||y_sf - y_dense|| / ||y_dense|| = %e\n",
+      (double)(norm_dense > 0 ? norm_diff / norm_dense : norm_diff)));
     PetscCall(VecDestroy(&diff));
   }
 
-  /* Benchmark */
   if (ctx.bench) {
     PetscLogDouble tstart, tend;
     PetscInt       cStart, cEnd, nCells, iter;
@@ -878,7 +698,6 @@ int main(int argc, char **argv)
     PetscCall(DMPlexGetHeightStratum(dm, 0, &cStart, &cEnd));
     nCells = cEnd - cStart;
 
-    /* Warmup */
     PetscCall(ApplySumFact(dm, x, y_sf, &basis, LaplacianPointwise));
 
     PetscCall(PetscTime(&tstart));
@@ -895,11 +714,10 @@ int main(int argc, char **argv)
       nCells, degree, ctx.niter, (double)elapsed, (double)per_iter));
   }
 
-  /* Cleanup */
   PetscCall(Basis1DDestroy(&basis));
   PetscCall(VecDestroy(&x));
   PetscCall(VecDestroy(&y_sf));
-  PetscCall(VecDestroy(&y_ref));
+  PetscCall(VecDestroy(&y_dense));
   PetscCall(PetscFEDestroy(&fe));
   PetscCall(DMDestroy(&dm));
   PetscCall(PetscFinalize());

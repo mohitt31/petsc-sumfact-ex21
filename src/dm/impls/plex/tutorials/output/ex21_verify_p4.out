@@ -1,1 +1,2 @@
-TODO: placeholder test output to be generated against PETSc main branch
+Sum-factorization: dim=3 degree=4 nd=5 nq=5
+Verification: ||y_sf - y_dense|| / ||y_dense|| = 4.221107e-16

@@ -1,1 +1,2 @@
-TODO: placeholder test output to be generated against PETSc main branch
+Sum-factorization: dim=3 degree=4 nd=5 nq=5
+Benchmark: 64 cells, degree 4, 10 iters, 0.1139 s total, 1.138661e-02 s/iter
